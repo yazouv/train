@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [master]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -11,134 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-
 jobs:
-  # ---------------------------------------------------------------- checks
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all --check
+  checks:
+    uses: ./.github/workflows/checks.yml
 
-  clippy:
-    name: Clippy (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked -- -D warnings
-
-  test:
-    name: Tests (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-targets --locked
-      - run: cargo test --doc --locked
-
-  audit:
-    name: Audit dépendances
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - run: cargo audit
-
-  # ---------------------------------------------------------------- builds
   build:
-    name: Build ${{ matrix.target }}
-    needs: [fmt, clippy, test]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest,    archive: tar.gz }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, archive: tar.gz }
-          - { target: x86_64-apple-darwin,       os: macos-latest,     archive: tar.gz }
-          - { target: aarch64-apple-darwin,      os: macos-latest,     archive: tar.gz }
-          - { target: x86_64-pc-windows-msvc,    os: windows-latest,   archive: zip }
-          - { target: aarch64-pc-windows-msvc,   os: windows-latest,   archive: zip }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Compile
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package (tar.gz)
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: |
-          name="rail-${{ matrix.target }}"
-          mkdir "$name"
-          cp "target/${{ matrix.target }}/release/rail" "$name/"
-          [ -f LICENSE ] && cp LICENSE "$name/" || true
-          [ -f README.md ] && cp README.md "$name/" || true
-          tar czf "$name.tar.gz" "$name"
-          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Package (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $name = "rail-${{ matrix.target }}"
-          New-Item -ItemType Directory $name | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/rail.exe" $name
-          foreach ($f in 'LICENSE','README.md') { if (Test-Path $f) { Copy-Item $f $name } }
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
-          "ASSET=$name.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rail-${{ matrix.target }}
-          path: ${{ env.ASSET }}
-          if-no-files-found: error
-
-  # ---------------------------------------------------------------- release
-  release:
-    name: Release GitHub
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, audit]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum * > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+    needs: checks
+    uses: ./.github/workflows/build.yml
