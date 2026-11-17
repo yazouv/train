@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [master]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -11,134 +10,43 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
-  # ---------------------------------------------------------------- checks
-  fmt:
-    name: Format
+  # Un push sur master qui vient d'un merge de PR a déjà été vérifié et compilé
+  # dans la PR : on ne relance rien. Les push directs sur master restent vérifiés.
+  gate:
+    name: Déjà vérifié en PR ?
     runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all --check
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != push ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # En cas d'erreur d'API, on vérifie quand même (merged=0).
+          merged=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+                     --jq '[.[] | select(.merged_at != null)] | length' 2>/dev/null) || merged=0
+          [[ "$merged" =~ ^[0-9]+$ ]] || merged=0
+          if [ "$merged" -gt 0 ]; then
+            echo "Commit issu d'une PR mergée : checks et builds déjà faits dans la PR, on saute."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Push direct sur master : on vérifie."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
 
-  clippy:
-    name: Clippy (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked -- -D warnings
+  checks:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    uses: ./.github/workflows/checks.yml
 
-  test:
-    name: Tests (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-targets --locked
-      - run: cargo test --doc --locked
-
-  audit:
-    name: Audit dépendances
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - run: cargo audit
-
-  # ---------------------------------------------------------------- builds
   build:
-    name: Build ${{ matrix.target }}
-    needs: [fmt, clippy, test]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest,    archive: tar.gz }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, archive: tar.gz }
-          - { target: x86_64-apple-darwin,       os: macos-latest,     archive: tar.gz }
-          - { target: aarch64-apple-darwin,      os: macos-latest,     archive: tar.gz }
-          - { target: x86_64-pc-windows-msvc,    os: windows-latest,   archive: zip }
-          - { target: aarch64-pc-windows-msvc,   os: windows-latest,   archive: zip }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Compile
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package (tar.gz)
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: |
-          name="rail-${{ matrix.target }}"
-          mkdir "$name"
-          cp "target/${{ matrix.target }}/release/rail" "$name/"
-          [ -f LICENSE ] && cp LICENSE "$name/" || true
-          [ -f README.md ] && cp README.md "$name/" || true
-          tar czf "$name.tar.gz" "$name"
-          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Package (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $name = "rail-${{ matrix.target }}"
-          New-Item -ItemType Directory $name | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/rail.exe" $name
-          foreach ($f in 'LICENSE','README.md') { if (Test-Path $f) { Copy-Item $f $name } }
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
-          "ASSET=$name.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rail-${{ matrix.target }}
-          path: ${{ env.ASSET }}
-          if-no-files-found: error
-
-  # ---------------------------------------------------------------- release
-  release:
-    name: Release GitHub
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, audit]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum * > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+    needs: checks
+    uses: ./.github/workflows/build.yml

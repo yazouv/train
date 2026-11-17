@@ -1,0 +1,110 @@
+name: Release
+
+# Lancement manuel : onglet Actions → Release → « Run workflow ».
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (ex. 1.2.0). Laisser vide pour la détecter depuis les commits."
+        type: string
+        required: false
+        default: ""
+      bump:
+        description: "Si version vide : auto = d'après les commits (feat → mineure, fix → patch, ! ou BREAKING CHANGE → majeure)"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      dry_run:
+        description: "Essai à blanc : tout compiler et afficher le patch note, sans tag ni release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Version et patch note
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.prep.outputs.version }}
+      tag: ${{ steps.prep.outputs.tag }}
+    steps:
+      - name: Uniquement depuis master
+        if: github.ref != 'refs/heads/master'
+        run: |
+          echo "::error::Les releases se lancent depuis master (ici : ${{ github.ref_name }})."
+          exit 1
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: prep
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
+          NOTES_FILE: release-notes.md
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: bash .github/scripts/release-prepare.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  checks:
+    needs: prepare
+    uses: ./.github/workflows/checks.yml
+
+  build:
+    needs: [prepare, checks]
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    name: Publier ${{ needs.prepare.outputs.tag }}
+    needs: [prepare, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Commit de version et tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash .github/scripts/set-version.sh "$VERSION"
+          if ! git diff --quiet; then
+            git commit -am "chore(release): $TAG"
+          fi
+          git tag -a "$TAG" -m "$TAG"
+          # --atomic : si master a bougé depuis le lancement, rien n'est poussé.
+          git push --atomic origin "HEAD:refs/heads/master" "refs/tags/$TAG"
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          mv release-notes.md ../
+          sha256sum rail-* > SHA256SUMS.txt
+          ls -l
+
+      - name: Release GitHub
+        run: |
+          gh release create "$TAG" dist/* \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --verify-tag
